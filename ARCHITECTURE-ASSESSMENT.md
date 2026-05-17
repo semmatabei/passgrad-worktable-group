@@ -1,22 +1,26 @@
 # Architecture Assessment — Passgrad Worktable
 
-**Date**: May 16, 2026  
-**Status**: Draft — Pending Review  
+**Date**: May 17, 2026
+**Status**: Updated — Post Review
 **Scope**: No-code database engine + workflow engine for `passgrad-worktable-app`
 
 ---
 
 ## Summary of Decisions
 
-| Area                    | Decision                                                              |
-| ----------------------- | --------------------------------------------------------------------- |
-| Dynamic Schema          | Hybrid: metadata tables + JSONB record store                          |
-| Multi-tenancy           | Single project, shared tables, `tenant_id` row-level isolation        |
-| Workflow engine         | Cloudflare Workers + Queues + Cron Triggers (fully CF-native)         |
-| Automation layer        | Activepieces (Apache 2.0) — core product feature + monetization lever |
-| Tech stack              | Vite (React SPA) + Hono on Cloudflare Workers (monorepo)              |
-| Hosting                 | Cloudflare Pages (free) + Workers Paid $5/mo + Supabase free tier     |
-| **Total cost at start** | **~$5/mo**                                                            |
+| Area                    | Decision                                                                                              |
+| ----------------------- | ----------------------------------------------------------------------------------------------------- |
+| Dynamic Schema          | Hybrid: metadata tables + JSONB record store                                                          |
+| Multi-tenancy           | Single project, shared tables, `tenant_id` row-level isolation (RLS)                                 |
+| Workflow engine         | Activepieces engine (vendored MIT source) + pieces (npm) — runs inside Render API service (Node.js)  |
+| Job queue               | pg-boss on Supabase Postgres — no Redis, no separate queue service                                   |
+| Automation layer        | Activepieces React UI (copied + API-adapted, MIT) — core product feature + monetization lever        |
+| Tech stack              | Vite (React SPA) + Hono on Node.js/Render (monorepo)                                                 |
+| API layer               | Hono — REST API for the SPA (databases, records, fields, flows, tasks)                               |
+| Auth / DB isolation     | Supabase Auth + RLS with anon key + JWT forwarding through Hono                                       |
+| Grid                    | AG Grid Community (MIT) — migrate to Glide Data Grid if performance limits hit                       |
+| Hosting                 | Cloudflare Pages (free) + Render Starter ($7/mo) + Supabase free tier                                |
+| **Total cost at start** | **~$7/mo**                                                                                            |
 
 ---
 
@@ -152,6 +156,33 @@ Both are valid. The engine schema (`databases`, `fields`, `records`, etc.) is id
 
 ### RLS Policy Pattern
 
+All DB queries go server-side through Hono (no direct Supabase access from the browser). RLS is still enforced as a second layer of defense — a missing `WHERE tenant_id = ?` in any route cannot leak cross-tenant data.
+
+**Auth threading pattern (Hono → Supabase)**:
+
+Use the **anon key** (not service role) for all route queries. Pass the user's JWT in the `Authorization` header to each per-request Supabase client. Supabase PostgREST sets `request.jwt.claims` from the header, which `auth.uid()` and RLS policies read from.
+
+```typescript
+// apps/api/src/middleware/supabase.ts
+import { jwt } from 'hono/jwt'
+import { createClient } from '@supabase/supabase-js'
+
+// 1. Verify JWT using Supabase JWT secret
+app.use('*', (c, next) =>
+  jwt({ secret: c.env.SUPABASE_JWT_SECRET })(c, next)
+)
+
+// 2. Per-request Supabase client — forwards JWT so RLS fires
+app.use('*', async (c, next) => {
+  const supabase = createClient(c.env.SUPABASE_URL, c.env.SUPABASE_ANON_KEY, {
+    global: { headers: { Authorization: c.req.header('Authorization') ?? '' } },
+    auth: { persistSession: false, autoRefreshToken: false, detectSessionFromUrl: false },
+  })
+  c.set('supabase', supabase)
+  await next()
+})
+```
+
 ```sql
 -- Enable RLS on all tenant-scoped tables
 ALTER TABLE databases ENABLE ROW LEVEL SECURITY;
@@ -161,6 +192,12 @@ ALTER TABLE records ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON records
   USING (tenant_id = (SELECT tenant_id FROM profiles WHERE id = auth.uid()));
 ```
+
+### Supabase free tier operational notes
+
+- **Auto-pause after 1 week of inactivity**: Add a CF Cron Trigger (free) pinging `/health` on the API to keep dev/staging databases awake.
+- **2 active projects max on free**: dev and prod share the free tier. For staging, use a paused project or accept cold starts.
+- **500 MB DB, 50K MAU**: sufficient for MVP. Upgrade to Supabase Pro ($25/mo) when either limit approaches.
 
 ### Multi-use-case deployment model
 
@@ -182,155 +219,129 @@ Start with single project. Only split when a use case demonstrably needs it.
 
 ---
 
-## 3. Workflow Engine
+## 3. Workflow & Automation Engine
 
-### Current WMS gaps (from code audit)
+### Decision: Activepieces engine vendored into the Render API service (Node.js)
 
-- Step execution is client-side (`current_step + 1` in React)
-- Condition branches defined in schema but never evaluated
-- No automated triggers, no notifications, no external calls
-- No retry logic, no timeouts, no escalation
+The AP engine (`packages/server/engine`) is **not CF Workers compatible** — it targets Node.js 20 explicitly, uses `node:http`, `isolated-vm` (a native Node addon), `socket.io` IPC, and process-level DNS/socket patching. It cannot be bundled into a CF Worker.
 
-### Decision: Cloudflare Workers + Queues + Cron Triggers (fully CF-native, no n8n needed)
+**Solution**: The Hono API runs on Render (Node.js) rather than CF Workers. The AP engine and the pg-boss queue consumer run in the **same Node.js process** as the Hono HTTP server. No separate service, no Docker, no separate queue worker — one Render Web Service handles everything.
 
-Since the API already runs on Cloudflare Workers, the workflow engine lives in the **same codebase and deployment** — no separate service, no n8n, no Supabase Edge Functions required.
+**What is replaced (the "adapter layer")**:
 
-**Architecture**:
+| Activepieces layer            | Replaced with                                            |
+| ----------------------------- | -------------------------------------------------------- |
+| Their server API (NestJS)     | Hono API — owns flow definitions + execution state       |
+| Their Postgres/Redis          | Supabase (flow JSONB) + pg-boss on Supabase Postgres     |
+| Their auth system             | Our existing Supabase auth                               |
+| Their app shell (sidebar/nav) | Our React app shell                                      |
+| Their Docker container        | Nothing — engine runs in-process inside Render service   |
+
+**What is kept as-is**:
+
+| Activepieces layer                                | Status                            |
+| ------------------------------------------------- | --------------------------------- |
+| Engine execution logic                            | ✅ Copied verbatim (MIT)          |
+| Variable interpolation (`{{step1.output.email}}`) | ✅ Engine handles this            |
+| Branching / router step                           | ✅ Engine handles this            |
+| All 280+ piece connectors                         | ✅ npm packages, import as needed |
+| Flow builder React canvas                         | ✅ Copied, API layer swapped      |
+| Step config forms                                 | ✅ Copied, API layer swapped      |
+| Run history UI                                    | ✅ Copied, API layer swapped      |
+
+### Architecture
 
 ```
-User action (approve/submit step)
-  → API Worker (Hono route)
-    → Cloudflare Queue: 'workflow-jobs'
-      → Queue Consumer Worker: workflow-executor
-          ├── Load task + workflow_snapshot from Supabase DB
-          ├── Evaluate current step (condition branch, approval, action)
-          ├── Assign next owner
-          ├── Update DB
-          ├── Send notification email (Resend HTTP call)
-          └── Fire outbound webhooks to external systems
+User action (submit step / approve / reject)
+  → Hono API (POST /tasks/:id/action)  [Render Node.js]
+      ├── Write action to Supabase (audit trail)
+      ├── pg-boss.send('execute-flow', { flow_id, payload })
+      └── Return 200 immediately
 
-Time-based triggers (reminders, escalations, deadlines)
-  → Cloudflare Cron Trigger (runs a Worker on schedule)
-    → Same workflow-executor logic: scan overdue tasks → push to Queue
+pg-boss consumer (same Render process, background loop):
+  ├── Deserialize flow definition from Supabase JSONB
+  ├── Call vendored AP engine: engine.executeFlow(flow, context)
+  │     └── Engine calls @activepieces/piece-* npm packages per step
+  ├── Write run result + step outputs to Supabase (run_logs table)
+  └── PATCH /tasks/:id/state (internal call or direct Supabase write)
+
+Human-in-the-loop (approval steps):
+  → Engine writes { status: 'waiting_for_human', resume_token } to Supabase
+  → pg-boss job completes (acknowledged — no re-delivery)
+  → Optional escalation: pg-boss.sendAfter('escalate', payload, deadline_timestamp)
+  → Human approves → POST /tasks/:id/approve
+      ├── pg-boss.cancel(escalation_job_id)  ← cancel escalation if pending
+      └── pg-boss.send('execute-flow', { flow_id, resume_token, decision })
+
+Time-based triggers (reminders, escalations, deadlines):
+  → pg-boss built-in cron scheduler (no separate CF Cron needed)
+    → Finds overdue tasks → enqueues to execute-flow queue
+      → Same engine execution path
 ```
 
-**Why Cloudflare-native over Supabase Edge Functions + pg_cron**:
+### Process structure on Render
 
-|             | Supabase Edge Functions + pg_cron             | Cloudflare Workers + Queues + Cron            |
-| ----------- | --------------------------------------------- | --------------------------------------------- |
-| Language    | Deno (TypeScript, slightly different runtime) | Node-compatible Workers (same TS as your API) |
-| Scheduling  | pg_cron → pg_net HTTP call (indirect)         | Cron Triggers (native, built into Workers)    |
-| Queue/retry | Manual retry logic                            | Queues handle retry + dead-letter natively    |
-| Codebase    | Split across Supabase functions + CF Workers  | **Single codebase, single deploy**            |
-| Cold starts | Deno cold start                               | Near-zero (V8 isolates)                       |
-| Cost        | Free (but separate platform to manage)        | Included in $5/mo Workers Paid                |
+```typescript
+// apps/api/src/index.ts
+import { serve } from '@hono/node-server'
+import { app } from './app'
+import { startWorker } from './queues/worker'
 
-**Why not n8n**: n8n's Sustainable Use License prohibits using it as part of a commercial service. Additionally, hosting it requires a persistent server. Not needed here — outbound HTTP calls from Workers handle external integrations directly.
+serve(app, (info) => console.log(`API listening on port ${info.port}`))
+startWorker() // pg-boss polling loop — runs in same process, non-blocking
+```
 
-**Why not Temporal**: Requires a persistent server. Overkill for a state machine that fits in a Queue Consumer. Revisit if workflow complexity grows significantly.
+```typescript
+// apps/api/src/queues/worker.ts
+import PgBoss from 'pg-boss'
+import { executeFlow } from '../../../packages/vendor/ap-engine'
 
-### Cloudflare primitives used
+const boss = new PgBoss(process.env.DATABASE_URL)
 
-| Primitive         | Role                                          | Cost (Workers Paid)              |
-| ----------------- | --------------------------------------------- | -------------------------------- |
-| **Workers**       | Workflow execution logic                      | Included                         |
-| **Queues**        | Async job queue, automatic retry, dead-letter | 1M ops/mo included, then $0.40/M |
-| **Cron Triggers** | Scheduled scans (overdue tasks, reminders)    | Included                         |
-| **R2** (optional) | Task attachment storage                       | 10GB free                        |
-
-### Queue Consumer: `workflow-executor`
-
-```ts
-// Triggered by: queue message OR cron trigger
-async function executeWorkflowStep(taskId: string) {
-  // 1. Load task from Supabase
-  // 2. Evaluate current step type
-  // 3. Resolve condition branch if applicable
-  // 4. Advance step: update current_step, current_owner
-  // 5. Send email notification via Resend (HTTP fetch)
-  // 6. Fire outbound webhooks if configured on step
-  // 7. Write to workflow_logs
+export async function startWorker() {
+  await boss.start()
+  await boss.work('execute-flow', async (job) => {
+    const { flowId, resumeToken, payload } = job.data
+    const flow = await loadFlowFromSupabase(flowId)
+    const result = await executeFlow(flow, { payload, resumeToken })
+    await saveRunResult(result)
+  })
 }
-
-// Dead-letter handling: if step fails after N retries → alert admin
 ```
 
-### Cron Trigger for time-based events
+### Job queue: pg-boss on Supabase Postgres
 
-```toml
-# wrangler.toml
-[triggers]
-crons = ["0 * * * *"]  # every hour
-# Worker checks: overdue tasks, pending reminders, escalation deadlines
-```
+pg-boss (MIT, v12.18.2, actively maintained) stores jobs in a `pgboss` schema inside the existing Supabase Postgres database. No Redis, no separate queue service, no extra cost.
 
-### External integrations — Activepieces as core product feature
+| Feature              | pg-boss support                                               |
+| -------------------- | ------------------------------------------------------------- |
+| Delayed jobs         | Yes — `sendAfter(name, data, options, future_timestamp)`      |
+| Multi-day delays     | Yes — arbitrary future timestamps (no 24h cap)                |
+| Retry + backoff      | Yes — exponential backoff, configurable max attempts          |
+| Dead-letter queue    | Yes — explicit DLQ support                                    |
+| Cron scheduling      | Yes — built-in cron for time-based triggers                   |
+| Exactly-once         | Yes — Postgres `SKIP LOCKED`                                  |
+| Transactional enqueue| Yes — enqueue inside a Supabase transaction via Kysely/Drizzle|
 
-**Decision: Activepieces is a first-class product feature, not a future add-on.**
+**Why not Redis/BullMQ**: Adds $10/mo (Render Key Value Starter) and a second service dependency for no benefit over pg-boss given Supabase Postgres is already present.
 
-Automation extensibility is a selling point and a pricing lever. Clients configure their own integrations (WhatsApp, Slack, ERP, SIS, payment gateways) via a visual builder embedded in the platform. You monetize by gating:
+**Why not CF Queues**: No longer available — Hono API has moved off CF Workers to Render.
+
+### AP pieces license note
+
+Individual `@activepieces/piece-*` `package.json` files lack a `"license"` field. They are MIT by the root AP LICENSE (which explicitly covers all content outside `packages/ee/`). Automated license scanners (FOSSA, license-checker) will flag them as `UNLICENSED`. Add scanner overrides in CI config early.
+
+### Automation as core product feature
+
+Clients configure their own integrations (WhatsApp, Slack, ERP, SIS) via the copied AP flow builder embedded in the product shell. Monetized by gating:
 
 - Number of active automation flows per tenant
-- Number of workflow runs/month (e.g., 1K runs free, 10K on paid tier)
-- Access to premium connectors
-
-This mirrors how Zapier, Make, and n8n Cloud price — clients already understand the model.
-
-**Why Activepieces over n8n**: n8n's Sustainable Use License prohibits embedding in a commercial product. Activepieces is Apache 2.0 — copy, modify, embed, monetize freely.
-
-**Architecture with Activepieces**:
-
-```
-Two layers of automation:
-
-[Internal] Cloudflare Workers + Queues
-  → Workflow state machine (step routing, approvals, conditions)
-  → Not user-configurable — powers the WMS engine
-
-[External] Activepieces (self-hosted, Fly.io)
-  → User-configurable integrations ("when student enrolled → notify WhatsApp")
-  → Triggered by: Workers emitting a webhook event to Activepieces
-  → Connects to: 200+ pre-built connectors (Slack, WhatsApp, Google Sheets, etc.)
-  → Exposed in product UI as "Automation" section
-  → Metered per tenant for billing
-```
-
-**Hosting Activepieces**: Cloudflare Containers — runs a Docker container alongside your Workers, managed from the same `wrangler.toml`, same dashboard, same billing. Included in the $5/mo Workers Paid plan (25 GiB-hours/month free). Activepieces publishes an official Docker image so this works out of the box.
-
-```ts
-// Worker routes /automation/* requests to the Activepieces container
-import { Container, getContainer } from "@cloudflare/containers";
-
-export class ActivepiecesContainer extends Container {
-  defaultPort = 3000;
-  sleepAfter = "10m"; // sleeps when idle — saves compute on free allotment
-}
-
-export default {
-  async fetch(request, env) {
-    if (new URL(request.url).pathname.startsWith("/automation")) {
-      const ap = getContainer(env.ACTIVEPIECES, "singleton");
-      return ap.fetch(request);
-    }
-    return app.fetch(request, env); // Hono API handles everything else
-  },
-};
-```
-
-The `sleepAfter: "10m"` means the container stops when idle — perfect for early customers with infrequent automation runs. Wakes in seconds when a trigger fires.
-
-**Integration point**: When the workflow executor completes a step, it fires a webhook to Activepieces with the event payload. Activepieces routes to the client's configured flows. Decoupled — Activepieces going down doesn't break the core workflow engine.
+- Automation run count/month (e.g., 1K free, 10K on paid tier) — counted inside the pg-boss consumer before invoking the engine (single choke point)
+- Access to specific high-value connectors
 
 ### Notification layer
 
-**Resend** (free: 3,000 emails/mo) for system notifications (step assigned, task completed). One `fetch()` call from the Worker. Activepieces handles client-configured notification channels (WhatsApp, Slack, etc.).
-
-### Workflow engine cost
-
-- Cloudflare Workers + Queues + Cron: **included in $5/mo Paid plan**
-- Activepieces on Fly.io: **~$3/mo**
-- Resend: **$0** up to 3K emails/mo
-- **Total: ~$3/mo additional beyond the base $5/mo**
+**Resend** (free: 3,000 emails/mo) for system-level transactional email (password reset, onboarding). Automation flows handle workflow-driven notifications — clients configure channels themselves via the flow builder.
 
 ---
 
@@ -345,114 +356,135 @@ One developer maintains the full platform. This favors:
 - Minimal infrastructure to operate
 - Easy local development
 
-### Decision: Vite (React SPA) + Hono on Cloudflare Workers
+### Decision: Vite (React SPA) + Hono on Node.js (Render)
 
-**Why not Next.js**: Next.js on Cloudflare Workers requires `@opennextjs/cloudflare` adapter, which adds complexity and has quirks. Overkill for a single maintainer who is already comfortable with Vite.
-
-**Why not full server-rendered**: The app is highly interactive (spreadsheet-like grid, drag-and-drop, real-time). A SPA with Supabase Realtime handles this better than SSR. SEO is irrelevant for an authenticated B2B app.
+**Why not Next.js**: Overkill. The app is fully authenticated — SEO is irrelevant. Highly interactive (spreadsheet grid, drag-and-drop). A SPA with Supabase Realtime handles this better than SSR.
 
 **Why Hono**:
 
-- Runs identically on Cloudflare Workers, Node.js, Bun, and Deno — same codebase, different runtime adapter
+- Runtime-agnostic — runs on Node.js, CF Workers, Bun, Deno with a one-line adapter swap
 - TypeScript-first, minimal overhead
-- Easy to move from Workers → dedicated server: swap `import { serve } from '@hono/node-server'`
-- Great for building REST APIs that are called by the React SPA
+- If we ever need to move back to CF Workers (e.g., if AP engine compatibility is resolved in a future version), the swap is one import change
+
+**Why Render over CF Workers for the API**:
+
+The AP engine requires Node.js 20. Running on Render means one service hosts both the HTTP API and the background queue consumer — no separate worker process, no separate deployment. CF Workers is now only used for static asset delivery (CF Pages), which is free.
+
+### Database access from Render
+
+Render Node.js can connect to Supabase Postgres directly via TCP (unlike CF Workers). Two options remain:
+
+| Option                            | How                  | Notes                                                              |
+| --------------------------------- | -------------------- | ------------------------------------------------------------------ |
+| **Supabase REST API (PostgREST)** | `supabase-js` client | Simpler. RLS enforced automatically via JWT header.               |
+| **Direct Postgres (pg/Drizzle)**  | TCP connection       | More flexible for complex queries, joins, formula evaluation.     |
+
+**Recommendation**: Use `supabase-js` (PostgREST) for standard CRUD (records, fields, views). Use direct Postgres (`pg` + Drizzle ORM or raw SQL) for complex queries: cross-table formula resolution, bulk imports, aggregations. Both can coexist — `supabase-js` for auth/RLS enforcement, `pg` for power queries where you construct the `tenant_id` filter manually.
+
+### Grid: AG Grid Community — with defined migration path
+
+**Decision: AG Grid Community (MIT, v35.3.0).**
+
+AG Grid Community is backed by AG Grid Ltd (commercial company), actively maintained, and has the richest out-of-the-box feature set for a spreadsheet-like no-code product:
+
+- Full row grouping + aggregation (built-in, Community edition)
+- Built-in filter and sort UI
+- DOM-based cell renderers — custom field types (person picker, colored selects, attachments, date calendars) are React components, not canvas drawing code
+- Inline editing with extensible editor components
+
+**Migration path to Glide Data Grid**: If AG Grid Community performance becomes a bottleneck at high row counts (tens of thousands of rows with complex rendering), migrate to `@glideapps/glide-data-grid`. This is bounded by the `<DatabaseGrid>` abstraction layer — all grid-specific code lives inside `apps/web/src/components/database/grid/` and cell renderer files. The swap cost is 2–5 days given clean isolation. Row grouping and filter/sort UI will need custom implementation in Glide (not built-in).
+
+**Abstraction rule**: No AG Grid types (`ColDef`, `GridApi`, `ICellRendererParams`, etc.) imported outside `apps/web/src/components/database/grid/`. All cell renderers live in `apps/web/src/components/database/cells/`. The rest of the app only sees `<DatabaseGrid columns={...} data={...} onCellEdit={...} />`.
 
 ### Monorepo structure
 
 ```
 passgrad-worktable-app/
 ├── apps/
-│   ├── web/              ← Vite + React SPA
+│   ├── web/                          ← Vite + React SPA (Cloudflare Pages)
 │   │   └── src/
 │   │       ├── components/
-│   │       │   ├── database/   ← grid, views, field editors
-│   │       │   └── workflow/   ← workflow builder, task UI
+│   │       │   ├── database/
+│   │       │   │   ├── grid/         ← <DatabaseGrid> wrapper (AG Grid, swappable)
+│   │       │   │   └── cells/        ← cell renderers per field type (React components)
+│   │       │   └── workflow/         ← task UI, approval forms
+│   │       ├── features/
+│   │       │   └── automation/       ← COPIED from AP packages/ui/src/features/flows/
+│   │       │         ├── canvas/     ← React Flow canvas (kept as-is)
+│   │       │         ├── api/        ← AP API calls → replaced with Hono endpoints
+│   │       │         └── ...         ← step forms, piece selector, run history (kept as-is)
 │   │       └── pages/
-│   └── api/              ← Hono app (runs on Workers or Node)
+│   └── api/                          ← Hono app + pg-boss worker (Render Node.js)
 │       └── src/
 │           ├── routes/
 │           │   ├── databases.ts
 │           │   ├── records.ts
 │           │   ├── fields.ts
+│           │   ├── flows.ts          ← AP-compatible flow definition CRUD
 │           │   └── workflows.ts
-│           └── index.ts  ← Hono app entry
+│           ├── queues/
+│           │   └── worker.ts         ← pg-boss consumer + AP engine calls (same process)
+│           ├── middleware/
+│           │   └── supabase.ts       ← JWT verification + per-request Supabase client
+│           └── index.ts              ← serve(app) + startWorker()
 ├── packages/
-│   ├── core/             ← Vendored from Teable MIT packages
+│   ├── vendor/
+│   │   └── ap-engine/                ← COPIED from AP packages/server/engine/src (MIT)
+│   │         ├── executor/           ← flow + step execution logic (kept as-is)
+│   │         └── storage/            ← IEngineStorage interface → Supabase implementation
+│   ├── core/                         ← Vendored from Teable packages/core (MIT)
 │   │   ├── field-types/
-│   │   ├── formula/
+│   │   ├── formula/                  ← ANTLR4-based (antlr4ts — pure JS, no Node-only deps)
 │   │   └── filter/
-│   └── shared-types/     ← Shared TypeScript types
+│   └── shared-types/                 ← Shared TypeScript types
 └── supabase/
-    ├── functions/        ← Edge Functions (workflow-executor, etc.)
+    ├── functions/                    ← Edge Functions (tenant onboarding, health ping)
     └── migrations/
 ```
 
-### Serverless now, server later
+**Copy-and-adapt rule**: When copying from Activepieces source, only touch files in designated adapter seams (`api/`, `storage/`). Leave execution logic, UI canvas, and step forms untouched to keep upstream diffs minimal.
 
-The key decision: **use Hono**. Hono is runtime-agnostic.
-
-```ts
-// Today: Cloudflare Workers
-export default app; // workers entry
-
-// Later: Node.js server (same app code)
-import { serve } from "@hono/node-server";
-serve(app); // swap one import, done
-```
-
-Moving from Workers to a dedicated server is a ~1 hour change when the time comes, not a rewrite.
-
-### Database access from Workers
-
-Workers cannot use Supabase's Postgres connection directly (TCP not allowed). Two options:
-
-| Option                            | How                    | Notes                                                                                     |
-| --------------------------------- | ---------------------- | ----------------------------------------------------------------------------------------- |
-| **Supabase REST API (PostgREST)** | `supabase-js` client   | ✅ Works natively from Workers. No connection pooling needed.                             |
-| **Cloudflare Hyperdrive**         | TCP proxy for Postgres | ✅ $0 with Workers Paid plan. Direct SQL from Workers. More flexible for complex queries. |
-
-**Recommendation**: Start with Supabase REST (`supabase-js`). Migrate to Hyperdrive for complex queries (formula evaluation, cross-table aggregations) when needed.
+**AP upstream sync**: Maintain a `VENDOR.md` log recording which AP git commit each vendored copy was taken from. Review AP releases quarterly for engine bug fixes and new pieces.
 
 ---
 
 ## 5. Hosting Map
 
-### Decision: Cloudflare Pages + Workers Paid ($5/mo) + Supabase Free
+### Decision: Cloudflare Pages (free) + Render Starter ($7/mo) + Supabase Free
 
-| Service                     | What it hosts                                           | Cost       | Free limit                                           |
-| --------------------------- | ------------------------------------------------------- | ---------- | ---------------------------------------------------- |
-| **Cloudflare Pages**        | React SPA (static assets)                               | **$0**     | Unlimited static asset requests                      |
-| **Cloudflare Workers Paid** | Hono API + Workflow engine + Cron + Queues + Containers | **$5/mo**  | 10M requests, 1M Queue ops, 25 GiB-hrs Containers/mo |
-| **Supabase Free**           | Postgres DB + Auth + Storage                            | **$0**     | 500MB DB, 1GB storage                                |
-| **Resend**                  | System email notifications                              | **$0**     | 3,000 emails/mo                                      |
-| **Total**                   |                                                         | **~$5/mo** |                                                      |
+| Service                  | What it hosts                                        | Cost       | Notes                                   |
+| ------------------------ | ---------------------------------------------------- | ---------- | --------------------------------------- |
+| **Cloudflare Pages**     | React SPA (static assets)                            | **$0**     | Unlimited static asset requests         |
+| **Render Web Service**   | Hono API + pg-boss worker + AP engine (one service)  | **$7/mo**  | 512 MB RAM, 0.5 CPU, always-on          |
+| **Supabase Free**        | Postgres DB + Auth + pg-boss schema + flow JSONB     | **$0**     | 500MB DB, 50K MAU, 2 active projects    |
+| **Cloudflare R2**        | File/attachment storage                              | **$0**     | 10GB storage, no egress fees            |
+| **Resend**               | System email notifications                           | **$0**     | 3,000 emails/mo                         |
+| **Cloudflare Workers**   | Not used (API moved to Render)                       | **$0**     | CF Pages does not require Workers plan  |
+| **Total**                |                                                      | **~$7/mo** |                                         |
 
 ### When to upgrade
 
-| Trigger                              | Action                                              | New cost |
-| ------------------------------------ | --------------------------------------------------- | -------- |
-| DB > 500MB or > 50K MAU              | Supabase Pro                                        | +$25/mo  |
-| API > 10M requests/mo                | Already included in Workers Paid; just CPU billing  | +small   |
-| Activepieces > 25 GiB-hrs/mo         | Containers billed at $0.0000025/GiB-sec (very low)  | +small   |
-| Workflow complexity needs durability | Replace Queue Consumer with Temporal on a Container | +small   |
+| Trigger                        | Action                                          | New cost   |
+| ------------------------------ | ----------------------------------------------- | ---------- |
+| DB > 500MB or > 50K MAU        | Supabase Pro                                    | +$25/mo    |
+| API memory pressure / slow jobs| Render Standard (2 GB RAM)                      | +$18/mo    |
+| High automation job volume     | Second Render worker service (dedicated consumer)| +$7/mo    |
+| Attachments > 10GB             | R2 $0.015/GB-mo beyond free tier                | +small     |
 
-### Cloudflare Workers limitations to know
+### Render operational notes
 
-- **No persistent TCP connections**: Can't run a long-running Node.js process. Stateless per request.
-- **CPU time limit**: 30 seconds per invocation on Paid plan (more than enough for API calls).
-- **No filesystem access**: Use R2 for file storage, not local disk.
-- **Cold starts**: Near zero on Workers (V8 isolates, not containers). Not an issue.
+- **No scale-to-zero**: Render Web Services are always-on. The $7/mo is fixed regardless of traffic. Acceptable at this scale.
+- **pg-boss recovery on restart**: If the Render service restarts, pg-boss recovers in-flight jobs cleanly after the visibility timeout. No data loss.
+- **Health check**: Render requires an HTTP health check endpoint for Web Services. Hono serves `GET /health → 200`. Use a free uptime monitor (e.g., UptimeRobot free tier) to ping this endpoint every 5 minutes — this also keeps the Supabase project from auto-pausing.
+- **Local development**: `@hono/node-server` + pg-boss against a local Postgres (or Supabase local dev) — no emulators or special tooling needed. Run with `pnpm dev` in `apps/api/`.
 
 ### File storage
 
-Use **Supabase Storage** (1GB free) initially. If attachment storage grows, switch to **Cloudflare R2** (10GB free, no egress fees).
+Use **Cloudflare R2** from day one. 10GB free, zero egress fees. Access control is handled by Hono: verify auth → generate a short-lived R2 presigned URL → return to client. R2 is accessed via the AWS S3-compatible API from Node.js using `@aws-sdk/client-s3`. Supabase Storage not used.
 
 ---
 
 ## 6. Use-Case Deployment Pattern
-
-For different verticals (AMS, kiosk POS, healthcare):
 
 ```
 One codebase (passgrad-worktable-app)
@@ -466,12 +498,11 @@ One codebase (passgrad-worktable-app)
         ├── ams.passgrad.com     → own Supabase project, AMS presets
         ├── kiosk.passgrad.com   → own Supabase project, POS presets
         └── clinic.passgrad.com  → own Supabase project, healthcare presets
-              Same Workers codebase, different SUPABASE_URL env var per deployment
-              Cloudflare allows multiple Pages deployments from same repo
+              Same Render + Pages deployment, different env vars per deployment
               Each Supabase project stays within free tier (500MB) for early customers
 ```
 
-**Which to choose**: Start with Option A (simpler). Move to Option B per use-case only when you need clean product separation, different pricing tiers, or compliance requirements. The codebase never changes — just the environment variables.
+**Which to choose**: Start with Option A (simpler). Move to Option B per use-case only when you need clean product separation, different pricing tiers, or compliance requirements. The codebase never changes — just environment variables.
 
 Tenant onboarding for a new university (AMS):
 
@@ -480,16 +511,19 @@ Tenant onboarding for a new university (AMS):
 3. Seed default workflow templates (bulk enrollment, course registration)
 4. Create admin user
 
-This is a ~30-second operation via an Edge Function, not a manual process.
+This is a ~30-second operation via a Supabase Edge Function, not a manual process.
 
 ---
 
 ## Open Questions (for later)
 
-1. **Formula engine**: Use Teable's MIT `packages/core/formula` vendored in, or build a simpler expression evaluator? Teable's uses ANTLR grammar — powerful but heavy. Assess when implementing formula field.
-2. **Real-time collaboration**: Supabase Realtime (free) for live record updates. Sufficient for initial use cases.
+1. **Formula engine**: Teable's `packages/core/formula` uses ANTLR4 (`antlr4ts` — pure JS, runs in any environment). Confirmed viable for vendoring. Assess complexity vs. a simpler expression evaluator when implementing formula fields.
+2. **Real-time collaboration**: Supabase Realtime (free, 200 concurrent connections) for live record updates. Sufficient for initial use cases.
 3. **Offline support**: Not in scope for MVP. Note for healthcare use case (clinics with spotty internet).
 4. **Compliance**: Healthcare deployments may require separate Supabase project for data isolation. Decide per client contract, not upfront.
-5. **Bulk import performance**: CSV import of 10K student records via JSONB insert — benchmark before launch. May need batching + background processing via Queue.
-6. **Activepieces billing metering**: Decide how to count and expose automation run usage per tenant. Options: proxy all Activepieces webhook triggers through the API (count there), or use Activepieces' own execution logs via API. Assess when building the billing layer.
-7. **Activepieces UI embedding**: Decide whether to deep-link clients to Activepieces' own UI, or embed it in an iframe within the product shell. Iframe is simpler; deep-link requires less maintenance.
+5. **Bulk import performance**: CSV import of 10K student records via JSONB insert — benchmark before launch. May need batching through the pg-boss queue (enqueue as a background job, stream results).
+6. **Automation run metering**: Count runs inside the pg-boss consumer before invoking the engine (single choke point). Write `run_count` increments to Supabase per tenant per billing period.
+7. **AP upstream sync strategy**: Maintain `VENDOR.md` logging the AP git commit each vendor copy was taken from. Review quarterly. Only sync `executor/` — never sync `storage/` (that is our adapter layer).
+8. **Direct Postgres vs PostgREST**: For complex formula resolution and cross-table aggregations, `pg` + raw SQL is more flexible. Establish which query patterns warrant direct Postgres vs `supabase-js` per route.
+9. **Render service split**: If job processing becomes CPU-heavy (many concurrent AP flows), split into two Render services: one for the Hono HTTP API, one for the pg-boss consumer. Same codebase, different start commands. Cost: +$7/mo.
+10. **Grid migration trigger**: Document the specific AG Grid Community limitations that would trigger a Glide Data Grid migration (e.g., >50K visible rows, rendering lag measured at Xms). Do not migrate speculatively.

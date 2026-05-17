@@ -1,0 +1,2 @@
+- FE stack: React-Router / tanstack router, tailwind v4, zustand, react-hook-form, zod. Use this repo as reference for ui pattern, base component, and how to do x.
+- Avoid RLS:
