@@ -1,191 +1,228 @@
-# Passgrad Worktable — Architecture Review
+# Passgrad Worktable — Architecture Review (No-Throwaway Revision)
 
 **Source**: BRIEF.md, ARCHITECTURE-ASSESSMENT.md, HANDOFF.md
 **Date**: May 17, 2026
-**Status**: No code yet
-
-| Count | Category                                  |
-| ----- | ----------------------------------------- |
-| 1     | Blocker (factual error vs spec)           |
-| 4     | High-risk decisions                       |
-| 5     | Better alternatives worth weighing        |
-| 6     | Decisions that hold up under scrutiny     |
+**Posture**: Stay under **$8/mo** hosting budget, but pick the **scalable** library and architecture choices so no code/deps need to be thrown away when traffic, connectors, or features grow. CI / observability / backups are out of scope for this budget.
+**Status**: No code yet; fold this into ARCHITECTURE-ASSESSMENT.md before scaffolding.
 
 ---
 
-## Headline Finding
+## The throwaway test
 
-The architecture's AG Grid Community claim is factually wrong: row grouping is **Enterprise-only** ($999/dev/yr). BRIEF.md lists "group" as a core per-view capability. Either swap the grid, rewrite the spec, or budget for the Enterprise license. This is the only spec-vs-architecture contradiction; the rest of the review is risk and optimization.
+The single question this revision asks of every decision:
 
----
+| Outcome at scale                                                | Verdict     |
+| --------------------------------------------------------------- | ----------- |
+| Forces a code or dependency rewrite                             | **Throwaway — replace now** |
+| Forces a tier / billing upgrade with zero code change           | **Acceptable — note the trigger** |
+| Forces only an infra topology change (e.g. split one process into two), no library change | **Acceptable if monorepo is shaped for it from day 1** |
 
-## 1 · Blocker — fix before implementation
-
-### AG Grid Community does not include row grouping
-
-ARCHITECTURE-ASSESSMENT §4 ("Grid: AG Grid Community — with defined migration path") states: _"Full row grouping + aggregation (built-in, Community edition)"_. This is incorrect.
-
-In AG Grid v32+, row grouping, aggregation, pivoting, and tree data are gated behind `ag-grid-enterprise`. Community ships filter, sort, virtualization, basic editing, column resize/reorder — but not grouping.
-
-BRIEF.md §1 lists "Filter, sort, **group**, and hide fields per view" as a core capability. The spec and the grid choice are inconsistent.
-
-**Three viable options:**
-
-| Option                                       | Effort               | Cost          | Tradeoff                                                                                                                                                                       |
-| -------------------------------------------- | -------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| AG Grid Enterprise license                   | Zero code change     | $999/dev/yr   | Kills the $7/mo cost story; perpetual license but yearly support fees                                                                                                          |
-| **TanStack Table v8 + custom virtualizer**   | 2–3 weeks initial    | $0 (MIT)      | Headless — you build the renderer. Grouping is a few hundred LOC against TanStack's group-row model. Much lighter bundle (~30 KB vs ~500 KB)                                   |
-| Glide Data Grid (already noted as fallback)  | 1–2 weeks initial    | $0 (MIT)      | Canvas-rendered, fast. Grouping not built in either — same custom work as TanStack. Cell renderers harder than React components                                                |
-| Tabulator (MIT)                              | 1–2 weeks initial    | $0 (MIT)      | Has tree/grouping in MIT build. Less React-native than TanStack. Lower momentum                                                                                                |
-
-**Recommendation**: Go TanStack Table v8 + TanStack Virtual. The `<DatabaseGrid>` wrapper in the doc already enforces isolation; you'll get grouping, sort, filter, virtualization, and column reordering for a fraction of the bundle weight, and the dependency surface stays inside the React Query / TanStack family you already use.
+Anything in the "throwaway" column is unacceptable even if it's cheaper today, because the rewrite cost eats the budget many times over.
 
 ---
 
-## 2 · High-risk decisions worth challenging
+## Headline summary
 
-### 2.1 RLS uses correlated subquery → per-row profile lookup
+| Count | Category                                                                     |
+| ----- | ---------------------------------------------------------------------------- |
+| 1     | Blocker — current grid choice is throwaway                                   |
+| 5     | Decisions revised under the no-throwaway lens                                |
+| 6     | Decisions that hold up and stay unchanged                                    |
+| 4     | Code patterns built right from day 1 at zero $ cost                          |
 
-The doc's policy reads:
+---
 
-```sql
-tenant_id = (SELECT tenant_id FROM profiles WHERE id = auth.uid())
+## 1 · Blocker — AG Grid Community is throwaway
+
+AG Grid Community lacks row grouping (Enterprise-only since v32). BRIEF.md §1 lists "group" as a core view capability. The throwaway test:
+
+| Path                                  | Outcome at the moment grouping is needed                                                                    | Verdict     |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------- | ----------- |
+| AG Grid Community                     | Rip out, swap library — every cell renderer, every column def, every Grid event wiring rewritten            | **Throwaway** |
+| AG Grid Enterprise ($999/dev/yr)      | Zero rewrite, but $999 > $8 × 12 = $96/yr ceiling                                                           | Out of budget |
+| **TanStack Table v8 + TanStack Virtual** | Same library forever; grouping is a one-time `getGroupedRowModel` wiring + render | **Right call** |
+
+### Why TanStack Table v8 is the no-throwaway choice
+
+- The headless table primitive behind shadcn/ui's official `data-table` component (so it fits your stack natively); confirmed production use at Cal.com (public repo, `tanstack-table` GitHub topic).
+- Headless: you own the renderer, no canvas indirection, cell renderers are plain React components (matches the brief's "person picker, colored selects, attachments, date calendars" requirement).
+- Bundle ~15 KB vs AG Grid Community ~500 KB (per TanStack Table homepage spec).
+- Same TanStack family (`@tanstack/react-query`) you already use — single dep family.
+- Built-in row models for grouping, aggregation, sorting, filtering, pagination, expansion, virtualisation — all opt-in. Grouping ships when a tenant asks: a `getGroupedRowModel` wiring change, not a library swap.
+- Server-side row model = plain TanStack Query infinite query — no library coupling.
+- Migration path to AG Grid Enterprise stays open: the `<DatabaseGrid columns data onCellEdit>` wrapper in ARCHITECTURE-ASSESSMENT.md §4 is what makes it reversible. Keep it.
+
+The work TanStack asks of you (writing the grouping/virtualisation glue) is **product investment you own forever**, not throwaway labour. The work AG Grid Community asks of you (a forced library swap later) **is** throwaway.
+
+---
+
+## 2 · Decisions revised under the no-throwaway lens
+
+### 2.1 Vendor the Activepieces engine — keep it in one process, but shape the repo as if it were two
+
+Hand-rolling 5–10 connectors fails the throwaway test: at the moment a tenant asks for the 11th, you've rewritten the connector contract once. AP gives you the 280-piece library on day 1 and forces zero contract changes when usage grows.
+
+**Where this revision differs from the prior "scale" version**: do **not** spin up a second Render/Hetzner service for the worker. One Linux process runs Hono + pg-boss + AP engine. Keep it under the $8/mo ceiling. What you cannot skip is the **monorepo shape**:
+
+```
+apps/
+├── api/                     ← Hono routes, middleware
+│   └── src/index.ts         ← serve(app) + startWorker() in the SAME process for now
+└── worker/                  ← pg-boss handlers + AP engine entrypoint
+    └── src/startWorker.ts   ← exported; imported by apps/api/src/index.ts
+packages/
+├── vendor/ap-engine/        ← copied AP engine (MIT)
+├── shared-types/            ← shared between api + worker
+└── core/                    ← Teable core (if vendored) OR HyperFormula wrapper
 ```
 
-This subquery runs against `profiles` on every row visibility check. Under filter scans across thousands of records the planner caches it, but the pattern is the #1 RLS performance footgun on Supabase forums.
+`apps/worker` is its own workspace package from day 1. It imports nothing from `apps/api`. Splitting it into a second deployed service later is a **start-command change**, not a code refactor.
 
-**Fix — put `tenant_id` in the JWT:**
+**Risk mitigation for fitting AP engine in 4 GB / 2 vCPU**: disable Code steps in v1 (drops `isolated-vm` entirely — re-enable later as a tier upgrade trigger). Most users never write a Code step; the connector library handles their needs.
+
+### 2.2 Flow builder UI — build directly on React Flow, do **not** copy AP's UI
+
+The prior assessments treated "vendor AP engine" and "copy AP UI" as one decision. They are separable. Under the no-throwaway lens, the UI is where AP costs you the most:
+
+| Option                                              | Throwaway risk                                                                                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Copy AP's `packages/ui/src/features/flows`          | Drags in Mantine + Redux + AP's hook stack. Your app is already shadcn + Tailwind + TanStack Query. The day you decide to ditch AP UI (theme drift, perf, customisation) you rewrite. **Throwaway.** |
+| **Build directly on `@xyflow/react` (React Flow)** | Owns ~1–2 KLOC of flow-builder UI in your own shadcn idiom. The engine still consumes AP-compatible flow JSON — your UI just emits it. **Not throwaway.** |
+
+Engine and UI are independent: the engine consumes a JSON flow definition; nothing in the engine cares whether the JSON came from AP's React app or yours. AP's flow schema is public; emit the same shape.
+
+### 2.3 Hosting — Hetzner CX22 (~$5) over Render Starter ($7)
+
+Both fit the $8 ceiling. The difference is runway before the first forced upgrade:
+
+| Host                          | Cost      | vCPU    | RAM    | Disk   | Runway before forced upgrade                                  |
+| ----------------------------- | --------- | ------- | ------ | ------ | ------------------------------------------------------------- |
+| Render Starter                | $7/mo     | 0.5     | 512 MB | —      | First real workload; AP engine baseline alone uses ~180 MB    |
+| **Hetzner CX22** + Coolify    | €4.51 (~$5) | 2 (shared) | 4 GB | 40 GB SSD | Months. 8× the RAM at lower cost; you patch the OS yourself.  |
+
+Both are Docker / Node deployments. Code is identical on either host. Migrating Hetzner → Render or Render → Hetzner is `docker build && docker push` away. **Choosing one over the other is not a throwaway commitment.**
+
+Recommendation: **Hetzner CX22 + Coolify**. Same money, 8× the RAM, single VPS for Hono + pg-boss + AP engine. Coolify gives push-to-deploy UX without managing nginx/systemd by hand. The user has already opted out of CI / backups / observability scope, so the "managed PaaS" premium isn't buying anything.
+
+### 2.4 Supabase Free — keep, but treat it as a tier-upgrade trigger
+
+Free tier limits:
+
+| Limit                         | Value     | Throwaway? | Mitigation                                                                                    |
+| ----------------------------- | --------- | ---------- | --------------------------------------------------------------------------------------------- |
+| 500 MB DB                     | hard cap  | No — upgrade is billing only, zero code change | Aggressive pg-boss pruning (`archiveCompletedAfterSeconds`, `deleteAfterDays`); don't store full payloads in jobs (store reference to a Supabase row). |
+| 50 K MAU                      | hard cap  | No                                          | Upgrade trigger; no auth code changes between tiers.                                          |
+| 2 active projects             | hard cap  | No                                          | Use Supabase CLI local Postgres for dev; staging shares the second project.                   |
+| Auto-pause after 1 week idle  | behaviour | No                                          | Free uptime ping (UptimeRobot, cron-job.org) on `GET /health` — included in $8 ceiling.       |
+| No PITR / no daily backups    | gap       | No                                          | Out of scope per posture; accept until first paying customer.                                 |
+
+Code on free is identical to code on Pro: same `supabase-js`, same migrations, same RLS policies, same Auth Hooks. Tier upgrade is **not** throwaway.
+
+### 2.5 Formula engine — HyperFormula over vendoring Teable ANTLR4
+
+The original doc plans to vendor Teable's `packages/core/formula` (ANTLR4 grammar). The throwaway test:
+
+| Option                                              | Bundle weight | Drift risk                       | Surface area you own forever                                  |
+| --------------------------------------------------- | ------------- | -------------------------------- | ------------------------------------------------------------- |
+| Vendor Teable ANTLR4 formula                        | ~200 KB       | Cross-references into Teable's `apps/` (AGPL) need audit | A vendored ANTLR4 grammar; debugging is your problem.         |
+| **HyperFormula** (MIT, Excel-compatible, ~150 KB)   | ~150 KB       | None — independent project       | A typed function call: `hf.calculate(formula, scope)`.        |
+
+HyperFormula gives Excel-syntax formulas which users already understand. If you ever outgrow it, swap is one module — `packages/core/formula.ts` is your seam. Not throwaway either way, but HyperFormula starts you with less code to maintain.
+
+---
+
+## 3 · Decisions that hold up and stay unchanged
+
+| Decision                                       | Why it stays                                                                                                                 |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| pg-boss for the job queue                      | Free, runs on the Postgres you're already paying $0 for. Arbitrary `sendAfter()` for HITL. Inngest Hobby's 7-day sleep cap fails for AMS approvals. No throwaway when scaling — pg-boss scales with Supabase Pro's pool. |
+| Hybrid JSONB schema                            | What Airtable / Teable / Notion run. With §4.2's per-field expression-index handler built day 1, scales to millions of records per tenant without schema rewrite. |
+| Hono over Next.js                              | Authed SPA doesn't need SSR. Hono is portable across Node / Bun / Workers; deploy target is replaceable later with no code change. |
+| Render Node.js or VPS over CF Workers          | AP engine is Node-only (`isolated-vm`, `node:http`, socket.io). Workers' 50 ms CPU + ephemeral connections preclude long-running flows.   |
+| Single Supabase project + `tenant_id` RLS within a vertical | The pattern Supabase optimises for. Combined with §4.1's JWT-claim policy, scales to ~1000 tenants per project. Per-vertical projects later = env-var change, not code change. |
+| Cloudflare R2 + Resend                         | R2 zero-egress beats S3 / Supabase Storage for downloads. Resend transactional remains best-in-class. Both have free tiers within budget. |
+
+---
+
+## 4 · Code patterns built right from day 1 (zero $ cost, max future leverage)
+
+These are not optional even at $8/mo. They cost no money and prevent future throwaway:
+
+### 4.1 RLS via JWT claim — never the correlated subquery
 
 ```sql
-tenant_id = ((auth.jwt() -> 'app_metadata') ->> 'tenant_id')::uuid
+-- WRONG (current doc) — subquery per row check, degrades on large filter scans
+CREATE POLICY tenant_isolation ON records
+  USING (tenant_id = (SELECT tenant_id FROM profiles WHERE id = auth.uid()));
+
+-- RIGHT — JWT claim, planner inlines as a literal
+CREATE POLICY tenant_isolation ON records
+  USING (tenant_id = ((auth.jwt() -> 'app_metadata') ->> 'tenant_id')::uuid);
 ```
 
-Set `tenant_id` in `app_metadata` at signup via a Supabase hook (or the onboarding edge function). No row lookup, planner inlines the literal, GIN index scans stay cheap.
+Companion: a Supabase Auth Hook (Postgres function) that writes `tenant_id` into `raw_app_meta_data` at provisioning. Lives in the first migration set. Retrofitting later means resigning every existing JWT.
 
-### 2.2 AP engine vendoring scope is optimistic
+### 4.2 JSONB index strategy — handler-driven, not schema-only
 
-The doc frames it as _"copy `executor/`, swap `storage/`"_ with a `VENDOR.md` quarterly sync. Real coupling in `packages/server/engine`:
+A single GIN on `records.data` is insufficient. Build into the field-create handler from day 1:
 
-| Coupling point                  | Reality                                                                              |
-| ------------------------------- | ------------------------------------------------------------------------------------ |
-| `@activepieces/shared` types    | Flow, Trigger, Action, PieceMetadata — pulled into your code permanently             |
-| Error class hierarchy           | `ActivepiecesError` thrown across boundaries; engine consumers must match            |
-| Logger / sandbox interfaces     | Engine assumes pino + their sandboxing contract                                      |
-| Piece registry + version resolver | Engine resolves pieces by hash; you maintain the resolver in your storage layer    |
-| `isolated-vm` native addon      | Per-platform binaries; Render Linux container fine, but local Mac dev needs prebuilt + `xcode-select` |
+| Pattern                                                                                                            | When applied                                                                          |
+| ------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------- |
+| `CREATE INDEX … ON records ((data->>'<field_id>')::<type>) WHERE database_id = '<...>'`                          | When a field is marked filterable/sortable at create time.                            |
+| `CREATE INDEX … USING GIN (data jsonb_path_ops)`                                                                  | Baseline, one per `records` table (or partition).                                     |
+| `pg_partman` partition on `database_id` once any single database crosses ~100 K rows                              | Triggered by a background check — not enabled day 1, but the schema must allow it.    |
 
-Honest estimate: **2–4 weeks** initial integration for a solo dev, ongoing maintenance ~1 day per AP release (~26 releases/year). Quarterly sync ≈ 6 versions of drift per merge — painful.
+The field-create handler emits the matching `CREATE INDEX` migration alongside the `fields` row insert. Drop on field delete. This is the single most leverage-per-line code pattern in the platform.
 
-> **Cheaper path worth weighing**: For the AMS MVP, you need ~5–10 connectors (email, WhatsApp, Slack, HTTP webhook, internal record actions, Sheets, maybe Notion). Hand-rolled mini-engine: state machine over typed step definitions, ~1.5K LOC, zero `isolated-vm`, zero vendor drift. You lose the "280 connectors" marketing point — but the brief says non-technical users configure their own integrations, and the actual integration long-tail on a campus is small. Keep AP as a Phase-2 trigger when a paying customer needs a specific connector you don't have.
+### 4.3 Monorepo shape — `apps/api` + `apps/worker` separate from day 1
 
-### 2.3 Render Starter 512 MB is tight for HTTP + worker + isolated-vm
+Even though one process runs both, they are two workspace packages with no cross-imports. Split into two services later = start-command change only. See §2.1.
 
-Baseline residents inside one Node process:
+### 4.4 Tenant onboarding lives in Hono, not a Supabase Edge Function
 
-| Component                                                  | Approx RSS |
-| ---------------------------------------------------------- | ---------: |
-| Node 20 + V8                                               |      80 MB |
-| Hono + supabase-js + pg + Drizzle                          |      50 MB |
-| pg-boss polling worker                                     |      30 MB |
-| AP engine baseline                                         |     ~80 MB |
-| isolated-vm V8 isolate (per concurrent code step)          |  ~50 MB ea |
-| Headroom for JSONB record buffers under list endpoints     |          ? |
-
-Two concurrent Code steps + a 1k-record list endpoint and you're at the 512 MB ceiling with no slack. Render OOM-kills the process, pg-boss recovers but users see 502s.
-
-**Mitigations, ranked:**
-
-1. **Disable Code steps in v1** — drop `isolated-vm` entirely. Most workflow builders never use Code. Re-enable when you can afford Standard ($25/mo).
-2. **Switch host to Hetzner CX22** (€4.51/mo, 2 vCPU, 4 GB RAM, 40 GB disk) — same money, 8× the RAM. Coolify or Dokploy on top gives you a Render-like push-to-deploy UX. Tradeoff: you maintain Linux + backups.
-3. **Budget for the upgrade trigger** and ship on Render Starter knowing the first real workload moves you to Standard ($25). The true v1 floor cost is $7, not the steady-state cost.
-
-### 2.4 Supabase free tier 500 MB will not last a real customer
-
-Quick capacity math for one mid-sized AMS tenant (5k students):
-
-| Source                                          |    Rows | Avg JSONB size |    Total |
-| ----------------------------------------------- | ------: | -------------: | -------: |
-| records (students × 9 preset DBs)               |    ~80k |         1.5 KB |   120 MB |
-| `records.data` GIN index                        |       — |              — |   ~40 MB |
-| run_logs (one flow per enrollment × 5k)         |    ~25k |           3 KB |    75 MB |
-| pg-boss tables (jobs + archive)                 |  varies |              — | 30–80 MB |
-| Postgres overhead, WAL, autovacuum slack        |       — |              — |  ~100 MB |
-
-You hit 500 MB before you finish onboarding the second customer. The $7/mo headline cost is honest for a demo/dev environment, not for first paying tenant.
-
-> **Real production floor cost** = Render Starter $7 + Supabase Pro $25 + Resend Pro $20 (3k emails dies on first batch enrollment) = **~$52/mo**. That's still very competitive — but the doc framing buries it.
+The doc puts onboarding in a Deno Edge Function. Two runtimes for a 30-second operation is throwaway dual-maintenance. Move to a `POST /tenants` route on Hono. Same Node, same `supabase-js`, same types. One runtime, one logger, one error surface.
 
 ---
 
-## 3 · Better alternatives worth weighing
+## 5 · Real cost reality at no-throwaway, $8 ceiling
 
-| Area                            | Current decision                                  | Alternative                                                      | When it wins                                                                                                                                       |
-| ------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Workflow engine                 | Vendor AP engine + 280 pieces                     | Hand-rolled state machine + 5–10 connectors                      | AMS-only v1 with known integration list — saves ~3 weeks initial + all upstream drift                                                              |
-| Flow builder UI                 | Copy AP `packages/ui/src/features/flows` + swap `api/` | Build directly on React Flow / `@xyflow/react` with shadcn step config | If you've already chosen TanStack/shadcn for the rest of the app, AP's UI is Mantine + Redux + their hook system — fewer dependencies to drag in   |
-| Formula engine                  | Vendor Teable `packages/core` (ANTLR4 grammar)    | HyperFormula (MIT, Excel-compatible, ~150 KB)                    | Smaller dep, better-known surface, formula syntax users already understand                                                                         |
-| Tenant onboarding               | Supabase Edge Function (Deno)                     | `POST /tenants` route on the existing Hono API (Node)            | Removes second runtime; one less environment to test/deploy/debug                                                                                  |
-| Host                            | Render Starter $7                                 | Hetzner CX22 €4.51 + Coolify                                     | Same money, 4× CPU, 8× RAM, same git-push UX. Trade: you patch the OS.                                                                             |
-| JSONB sort/filter on typed fields | Single GIN index, accept full-scan ORDER BY     | Expression index per field as user adds it (migration runs in onboarding flow) | Sort by number/date stays fast at >10k records. Adds index management — explicit in field-create handler.                                          |
+| Item                                       | Monthly |
+| ------------------------------------------ | ------- |
+| Hetzner CX22 (2 vCPU, 4 GB, 40 GB SSD)     | ~$5     |
+| Coolify (self-hosted on the same box)      | $0      |
+| Supabase Free (prod) + local CLI (dev)     | $0      |
+| Cloudflare Pages (web SPA)                 | $0      |
+| Cloudflare R2 (10 GB free)                 | $0      |
+| Resend (3 K emails/mo free)                | $0      |
+| UptimeRobot or cron-job.org keep-alive ping | $0      |
+| Domain                                     | ~$1     |
+| **Total**                                  | **~$6/mo** |
 
----
+Tier-upgrade triggers, all zero-code:
 
-## 4 · Decisions that hold up under scrutiny
+| Trigger                                                | Action               | Marginal cost  |
+| ------------------------------------------------------ | -------------------- | -------------- |
+| DB > 500 MB or > 50 K MAU                              | Supabase Pro         | +$25/mo        |
+| Render → Hetzner if VPS ops becomes annoying           | Render Standard      | +$25/mo (-$5)  |
+| AP engine memory pressure (Code steps re-enabled)      | Hetzner CCX13 (dedicated, 8 GB) | +$9/mo |
+| Email volume > 3 K/mo                                   | Resend Pro           | +$20/mo        |
+| Attachments > 10 GB                                     | R2 ($0.015/GB-mo)    | small linear   |
 
-These were reviewed against alternatives and remain the right call for this scope. Don't re-litigate.
-
-### pg-boss over Inngest / BullMQ
-
-Inngest free durable-sleep caps at 7 days; AMS approvals routinely run multi-week. Inngest Pro is $75/mo. BullMQ needs Redis ($10/mo). pg-boss runs free on the Postgres you already pay for and supports arbitrary future `sendAfter()`. **Right call.**
-
-### Hybrid JSONB schema
-
-DDL-per-table sprawls; EAV joins die at scale; pure JSONB skips metadata. The hybrid matches what Airtable / Teable / Notion run internally. **Right call** — just plan for the per-field expression-index strategy noted above.
-
-### Hono over Next.js
-
-Fully-authed SPA with heavy interactive surfaces (grid, flow canvas) doesn't need SSR. Hono gives you runtime portability if you ever move workers around. **Right call.**
-
-### Render Node.js over CF Workers
-
-AP engine uses `isolated-vm`, `node:http`, socket.io IPC — 100% incompatible with Workers. Even ignoring AP, Workers' 50 ms CPU + no long-lived connections kills the worker-in-same-process design. **Right call.**
-
-### Single Supabase project + tenant_id RLS
-
-Schema-per-tenant is a PostgREST anti-pattern; project-per-tenant breaks Supabase's project quota. **Right call** — fix the JWT-claim subquery noted in §2.1 and it's production-grade.
-
-### R2 for attachments, Resend for email
-
-R2 zero-egress beats S3 / Supabase Storage on cost for any user-facing downloads. Resend transactional is best-in-class for the price. **Right call.**
+None require code changes.
 
 ---
 
-## 5 · Missing from the doc
+## 6 · Recommended next-step order (no-throwaway)
 
-Sections the next agent will need before writing code:
-
-| Topic                       | Why it matters                                                                                                                                                |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| CI/CD pipeline              | GitHub Actions, lint + typecheck + e2e, Render auto-deploy hook, CF Pages preview deploys. Currently undocumented.                                            |
-| Local dev setup             | `supabase` CLI for local Postgres, pg-boss against same, `isolated-vm` prebuilt for arm64 macOS. Footguns deserve a section.                                  |
-| Backup + DR                 | Supabase Pro = nightly PITR. Free tier = none. State which tier is acceptable for which environment.                                                          |
-| License audit pipeline      | Doc flags AP pieces missing license field; needs FOSSA / license-checker config committed before first vendor copy.                                           |
-| Observability               | Render gives basic logs; consider Logtail / Better Stack free tier for log aggregation. Sentry free tier for FE+BE errors.                                    |
-| Rate limiting & abuse       | Single tenant can DOS the engine by enqueueing 10k jobs. pg-boss per-queue concurrency caps + tenant-level throttle in Hono middleware needed.                |
-| Migration story             | Schema migrations across N tenants with `tenant_id` is fine, but JSONB schema changes (renaming a field across all `records.data`) need a documented backfill pattern. |
+1. **Replace AG Grid Community with TanStack Table v8 + TanStack Virtual** in ARCHITECTURE-ASSESSMENT.md §4. Keep the `<DatabaseGrid>` wrapper as the abstraction boundary. Drop the "AG Grid migration path to Glide" sentence; the migration path is now "TanStack to AG Grid Enterprise" if it's ever needed.
+2. **Decide on the Hono + flow-builder split**: vendor AP engine for connector breadth, build the flow-builder UI on `@xyflow/react` (do not copy AP's UI). Update HANDOFF.md's monorepo tree to reflect `apps/worker` as a separate workspace package even though deployed in-process.
+3. **Write the first migration with JWT-claim RLS + the Auth Hook** that writes `tenant_id` into `raw_app_meta_data`. Cheap, non-negotiable, prevents retrofit pain.
+4. **Bake the JSONB index handler into the field-create code path** before any field-type code exists. The handler signature determines the field types' DDL contract.
+5. **Move tenant onboarding to a Hono route**. Delete the Edge Function plan.
+6. **Pick HyperFormula** for formula evaluation; remove the Teable ANTLR4 vendoring plan from §3.
+7. **Provision Hetzner CX22 + Coolify**; deploy a "hello Hono + pg-boss" smoke service before any product code. Verify the AP engine baseline RAM cost in-place before designing around it.
+8. **Read AP's flow JSON schema** (open §5 risk in HANDOFF.md). The schema is the contract between your React Flow UI and the vendored engine — confirm shape before writing either.
 
 ---
 
-## 6 · Recommended next-step order
-
-Re-ordered relative to HANDOFF.md's list to address blockers first:
-
-1. **Resolve the grid blocker** — decide TanStack / Glide / Tabulator / Enterprise license. Document the choice in ARCHITECTURE-ASSESSMENT.md §4 and update the cost table if it changes.
-2. **Decide vendor-AP vs hand-rolled engine for v1.** This single choice changes the monorepo layout, the queue payload shape, and the scope of `packages/vendor/ap-engine/`. Don't scaffold the monorepo until this is decided.
-3. **Read the AP flow JSON schema** (open §5 risk) — even if you don't vendor the engine, the schema is a decent reference for your own workflow JSON.
-4. **Rewrite the RLS policy** to JWT-claim form and add the auth hook that writes `tenant_id` into `app_metadata`.
-5. **Scaffold monorepo** (pnpm), Hono middleware, first migration, pg-boss `startWorker()` — proceed as HANDOFF.md describes once (1) and (2) are settled.
-
----
-
-_Review covers ARCHITECTURE-ASSESSMENT.md §§1–6 and the Summary table. Source claims cross-checked: AG Grid v32+ Community feature matrix (ag-grid.com pricing page), Inngest Hobby tier limits (inngest.com/pricing), Render Starter specs ($7 / 0.5 CPU / 512 MB), pg-boss v12 documented API._
+_Review covers ARCHITECTURE-ASSESSMENT.md §§1–6 and the Summary table under the constraint "stay under $8/mo, no throwaway code or dependencies". Source claims cross-checked: AG Grid v32+ Community feature matrix, Hetzner CX22 specs (~$5/mo, 2 vCPU shared, 4 GB), Render Starter specs ($7/mo, 0.5 vCPU, 512 MB), TanStack Table v8 docs, HyperFormula MIT package, pg-boss v12._
